@@ -4599,14 +4599,37 @@ function Jl(e) {
 
     // ── SERVER-TICK SYNCHRONIZED EXECUTION ──
     if (v && v.alive) {
-        // 1. Process held placement keys exactly once per server tick
+        // 1. Process TICK 2 of Double-Hit (Secondary shot/swing)
+        if (_doubleHitState === 1) {
+            const secId = v.weapons[1];
+            const primId = v.weapons[0];
+            const angle = Ci();
+
+            O.send("z", secId, true);
+            O.send("F", 1, angle);
+            O.send("F", 0, angle);
+
+            // Re-equip Primary
+            O.send("z", primId, true);
+
+            markWeaponUsed(1, secId);
+            _doubleHitState = 0;
+
+            // Reset gear back to base hat
+            _updateBaseEquip();
+        } else {
+            // Normal base hat check (only runs once per 111ms tick, zero flicker!)
+            _updateBaseEquip();
+        }
+
+        // 2. Process held placement keys exactly once per server tick
         for (const key in _hkHeld) {
             if (_hkHeld[key] !== undefined && Jn()) {
                 _hkDoPlace(_hkHeld[key]);
             }
         }
 
-        // 2. Process health/bleed checks in direct sync with the tick
+        // 3. Process health/bleed checks in direct sync with the tick
         if (v.health < (v.maxHealth || 100) && localShame < 7) {
             eatFood((v.maxHealth || 100) - v.health);
         }
@@ -4661,7 +4684,7 @@ window.requestAnimFrame = function() {
 }();
 
 function as() {
-    He = Date.now(), K = He - Xi, Xi = He, bi(), Cl(), _checkAttackLoop(), _updateBaseEquip(), requestAnimFrame(as)
+    He = Date.now(), K = He - Xi, Xi = He, bi(), Cl(), _checkAttackLoop(), requestAnimFrame(as)
 }
 Hl();
 as();
@@ -4713,7 +4736,7 @@ setInterval(function _tickAutoBuyHat() {
 }, 1000);
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// INDEPENDENT PER-SLOT RELOAD TRACKER & DOUBLE-HIT COMBO
+// INDEPENDENT RELOAD TRACKER, RIVER CHECK & 1-TICK DOUBLE-HIT
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const weaponReadyAt = {
@@ -4738,39 +4761,97 @@ function markWeaponUsed(slotIndex, weaponId) {
     weaponReadyAt[slotIndex] = Date.now() + cooldown;
 }
 
+// ── Check if player is swimming in river (and not on a platform) ──
+function _isInRiver(p) {
+    if (!p || p.zIndex > 0) return false;
+    const riverTop = (y.mapScale / 2) - (y.riverWidth / 2);
+    const riverBottom = (y.mapScale / 2) + (y.riverWidth / 2);
+    return p.y >= riverTop && p.y <= riverBottom;
+}
+
+let _doubleHitState = 0; // 0 = idle, 1 = waiting for next tick to fire secondary
+
 function tryDoubleHit() {
-    if (!v || !v.alive || !Jn()) return;
+    if (!v || !v.alive || !Jn() || _doubleHitState !== 0) return;
 
     const primId = v.weapons[0];
     const secId = v.weapons[1];
     if (primId == null || secId == null) return;
 
-    // Verify both Primary and Secondary are completely off cooldown
+    // Both weapons must be ready
     if (!canAttack(0) || !canAttack(1)) return;
 
     const angle = Ci();
 
-    // 1. Equip damage gear (Bull Helmet & Shadow Wings if owned)
-    if (_isOwnedHat(7)) _equipHat(7, true);
-    if (_isOwnedAcc(19)) _equipAcc(19, true);
-    _awaitingAttackAck = true;
+    // ── TICK 1: Primary Weapon Attack ──
+    if (_isOwnedHat(7)) _equipHat(7, true);   // Bull Helmet
+    if (_isOwnedAcc(19)) _equipAcc(19, true); // Shadow Wings
 
-    // 2. Burst Primary swing
     O.send("z", primId, true);
     O.send("F", 1, angle);
     O.send("F", 0, angle);
 
-    // 3. Burst Secondary shot/swing
-    O.send("z", secId, true);
-    O.send("F", 1, angle);
-    O.send("F", 0, angle);
-
-    // 4. Return to Primary
-    O.send("z", primId, true);
-
-    // 5. Lock both slots with their authoritative cooldowns
     markWeaponUsed(0, primId);
-    markWeaponUsed(1, secId);
+
+    // Queue Secondary attack for the NEXT server tick (~111ms)
+    _doubleHitState = 1;
+}
+
+function _getBaseHat() {
+    if (!v || !v.alive) return 0;
+
+    const spearRangeThreshold = 280;
+
+    // 1. Check for Turrets in range
+    let turretInRange = false;
+    if (ge) {
+        for (let i = 0; i < ge.length; i++) {
+            const obj = ge[i];
+            if (!obj || !obj.active) continue;
+            const isTurret = obj.projectile === 1 || (obj.group && obj.group.id === 7) || obj.id === 17;
+            if (isTurret && obj.owner && obj.owner.sid !== v.sid && !(v.team && obj.owner.team && obj.owner.team === v.team)) {
+                if (M.getDistance(v.x, v.y, obj.x, obj.y) <= 700) {
+                    turretInRange = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Check for Enemies in range
+    let enemyWithinSpear = false;
+    let enemyWithMeleeWithinSpear = false;
+    if (E) {
+        for (let i = 0; i < E.length; i++) {
+            const p = E[i];
+            if (!p || p === v || !p.alive || !p.visible) continue;
+            if (v.team && p.team && p.team === v.team) continue;
+            const dist = M.getDistance(v.x, v.y, p.x, p.y);
+            if (dist <= spearRangeThreshold) {
+                enemyWithinSpear = true;
+                if (_hasDamageDealingPrimary(p)) {
+                    enemyWithMeleeWithinSpear = true;
+                }
+            }
+        }
+    }
+
+    // 3. Determine Base Hat: Flipper in river, Booster on land
+    let targetHat = _isInRiver(v) ? 31 : 12;
+
+    // 4. Combat threat overrides
+    if (turretInRange) {
+        targetHat = enemyWithMeleeWithinSpear ? 6 : 22; // Soldier vs EMP
+    } else if (enemyWithinSpear) {
+        targetHat = 6; // Soldier Helmet
+    }
+
+    // Return first owned fallback
+    if (_isOwnedHat(targetHat)) return targetHat;
+    if (_isInRiver(v) && _isOwnedHat(31)) return 31;
+    if (_isOwnedHat(12)) return 12;
+    if (_isOwnedHat(6)) return 6;
+    return 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
