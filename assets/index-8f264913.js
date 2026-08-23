@@ -3766,40 +3766,30 @@ function _hkDoPlace(slotIndex) {
     }
     const angle = Ci();
 
-    // Atomic equip -> place -> restore sequence
+    // 1. Select the item and trigger placement
     O.send("z", itemId, false);
     O.send("F", 1, angle);
     O.send("F", 0, angle);
-    O.send("z", restoreId, true);
 
-    // Resume attack if Left Mouse Button or Spacebar or RMB is held
-    if (U === 1) {
-        O.send("F", 1, Ci());
-    }
+    // 2. Queue the re-equip so it doesn't overwrite the active item in the current packet batch
+    queueMicrotask(function() {
+        if (!v || !v.alive) return;
+        O.send("z", restoreId, true);
+        if (U === 1) {
+            O.send("F", 1, Ci());
+        }
+    });
 }
 
 function _hkHoldStart(keyCode, slotIndex) {
     if (_hkHeld[keyCode]) return;
-
-    // 1. Instant placement on keydown (0ms delay)
+    // Initial immediate placement on keydown
     _hkDoPlace(slotIndex);
-
-    // 2. Fast repeat loop while held down (~25 times per sec)
-    const intervalId = setInterval(function () {
-        if (!_hkHeld[keyCode] || !v || !v.alive || !Jn()) {
-            _hkHoldStop(keyCode);
-            return;
-        }
-        _hkDoPlace(slotIndex);
-    }, 40);
-
-    _hkHeld[keyCode] = { slotIndex: slotIndex, intervalId: intervalId };
+    // Mark slot as held (Jl will handle subsequent ticks)
+    _hkHeld[keyCode] = slotIndex;
 }
 
 function _hkHoldStop(keyCode) {
-    const state = _hkHeld[keyCode];
-    if (!state) return;
-    clearInterval(state.intervalId);
     delete _hkHeld[keyCode];
 }
 
@@ -4241,7 +4231,13 @@ function Pl(e, t, i) {
     if (r) {
         r.startAnim(t, i);
         if (r === v) {
-            _onAttackTick(i);
+            // The server has confirmed the attack damage calculation on this exact tick.
+            // It is now safe to return to the base movement/defense hat.
+            if (_awaitingAttackAck) {
+                _awaitingAttackAck = false;
+                _updateBaseEquip();
+            }
+
             if (b.weapons[v.weaponIndex]) {
                 v.reloadMax = b.weapons[v.weaponIndex].speed;
                 v.reloadTimer = v.reloadMax;
@@ -4541,12 +4537,10 @@ function eatFood(deficit) {
     const maxHP = v.maxHealth || 100;
     if (v.health >= maxHP) return;
 
-    // Detect equipped food
     const foodId = (v.items && v.items[0] != null) ? v.items[0] : 0;
     const healAmt = ({ 0: 20, 1: 40, 2: 30 })[foodId] || 20;
     const count = Math.max(1, Math.ceil(deficit / healAmt));
 
-    // Preserve exact weapon or building item
     const holdingBuildItem = v.buildIndex >= 0;
     const restoreId = holdingBuildItem 
         ? v.buildIndex 
@@ -4554,18 +4548,21 @@ function eatFood(deficit) {
     const isWeapon = !holdingBuildItem;
     const angle = (typeof Ci === "function") ? Ci() : 0;
 
-    // 1. Select food -> 2. Eat -> 3. Instantly re-equip original weapon/item
+    // 1. Select food and consume
     O.send("z", foodId, false);
     for (let i = 0; i < count; i++) {
         O.send("F", 1, angle);
         O.send("F", 0, angle);
     }
-    O.send("z", restoreId, isWeapon);
 
-    // 4. CRITICAL: If you were holding left-click / spacebar (U == 1), RESUME your attack!
-    if (U === 1) {
-        O.send("F", 1, angle);
-    }
+    // 2. Defer restore
+    queueMicrotask(function() {
+        if (!v || !v.alive) return;
+        O.send("z", restoreId, isWeapon);
+        if (U === 1) {
+            O.send("F", 1, angle);
+        }
+    });
 }
 
 // Reactive heal: Fires the exact instant the server sends damage (Packet "O")
@@ -4601,9 +4598,19 @@ function Jl(e) {
     for (var i = 0; i < E.length; ++i) E[i].forcePos = !E[i].visible, E[i].visible = !1;
     for (var i = 0; i < e.length;) r = Rt(e[i]), r && (r.t1 = r.t2 === void 0 ? t : r.t2, r.t2 = t, r.x1 = r.x, r.y1 = r.y, r.x2 = e[i + 1], r.y2 = e[i + 2], r.d1 = r.d2 === void 0 ? e[i + 3] : r.d2, r.d2 = e[i + 3], r.dt = 0, r.buildIndex = e[i + 4], r.weaponIndex = e[i + 5], r.weaponVariant = e[i + 6], r.team = e[i + 7], r.isLeader = e[i + 8], r.skinIndex = e[i + 9], r.tailIndex = e[i + 10], r.iconIndex = e[i + 11], r.zIndex = e[i + 12], r.visible = !0), i += 13;
 
-    // Passive/bleed heal check (fires ONLY ONCE per server tick, ~9 times/sec)
-    if (v && v.alive && v.health < (v.maxHealth || 100) && localShame < 7) {
-        eatFood((v.maxHealth || 100) - v.health);
+    // ── SERVER-TICK SYNCHRONIZED EXECUTION ──
+    if (v && v.alive) {
+        // 1. Process held placement keys exactly once per server tick
+        for (const key in _hkHeld) {
+            if (_hkHeld[key] !== undefined && Jn()) {
+                _hkDoPlace(_hkHeld[key]);
+            }
+        }
+
+        // 2. Process health/bleed checks in direct sync with the tick
+        if (v.health < (v.maxHealth || 100) && localShame < 7) {
+            eatFood((v.maxHealth || 100) - v.health);
+        }
     }
 }
 
@@ -4775,14 +4782,13 @@ function _equipAcc(id, force) {
     O.send("c", 0, id, 1);
 }
 
+let _awaitingAttackAck = false;
+
 function _oneTickHat(hatId) {
     if (!v || !v.alive) return;
-    if (_hatOverrideTimer) clearTimeout(_hatOverrideTimer);
+    // Equip the combat hat immediately before the attack
     _equipHat(hatId, true);
-    _hatOverrideTimer = setTimeout(function() {
-        _hatOverrideTimer = null;
-        _updateBaseEquip();
-    }, 150);
+    _awaitingAttackAck = true;
 }
 
 function _oneTickAcc(accId) {
