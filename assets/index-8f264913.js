@@ -4855,10 +4855,10 @@ function _getBaseHat() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUTOMATED COMBAT HAT & ACCESSORY MACRO SYSTEM
+// AUTOMATED COMBAT, RELOAD & ACCESSORY MACRO SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const _DAMAGE_DEALING_WEAPONS = [1, 2, 3, 4, 5, 7]; // Hand Axe, Great Axe, Short Sword, Katana, Spear/Polearm, Daggers
+const _DAMAGE_DEALING_WEAPONS = [1, 2, 3, 4, 5, 7]; // Hand Axe, Great Axe, Short Sword, Katana, Spear, Daggers
 
 let _tKeyHeld = false;
 let _hatOverrideTimer = null;
@@ -4866,6 +4866,62 @@ let _accOverrideTimer = null;
 let _nextAttackTime = 0;
 let _lastEquippedHat = -1;
 let _lastEquippedAcc = -1;
+let _awaitingAttackAck = false;
+let _doubleHitState = 0; // 0 = idle, 1 = waiting for next tick to fire secondary
+
+const weaponReadyAt = {
+    0: 0, // Timestamp when Primary is ready
+    1: 0  // Timestamp when Secondary is ready
+};
+
+function getWeaponCooldown(weaponId) {
+    const wpn = b.weapons[weaponId];
+    if (!wpn) return 300;
+    const hat = Ze.find(h => h.id === v.skinIndex);
+    const atkSpdMult = (hat && hat.atkSpd) ? hat.atkSpd : 1.0;
+    return (wpn.speed || 300) * atkSpdMult;
+}
+
+function canAttack(slotIndex) {
+    return Date.now() >= (weaponReadyAt[slotIndex] || 0);
+}
+
+function markWeaponUsed(slotIndex, weaponId) {
+    const cooldown = getWeaponCooldown(weaponId);
+    weaponReadyAt[slotIndex] = Date.now() + cooldown;
+}
+
+function _isInRiver(p) {
+    if (!p || p.zIndex > 0) return false;
+    const riverTop = (y.mapScale / 2) - (y.riverWidth / 2);
+    const riverBottom = (y.mapScale / 2) + (y.riverWidth / 2);
+    return p.y >= riverTop && p.y <= riverBottom;
+}
+
+function tryDoubleHit() {
+    if (!v || !v.alive || !Jn() || _doubleHitState !== 0) return;
+
+    const primId = v.weapons[0];
+    const secId = v.weapons[1];
+    if (primId == null || secId == null) return;
+
+    if (!canAttack(0) || !canAttack(1)) return;
+
+    const angle = Ci();
+
+    // TICK 1: Primary Hit with Damage Gear
+    if (_isOwnedHat(7)) _equipHat(7, true);   // Bull Helmet
+    if (_isOwnedAcc(19)) _equipAcc(19, true); // Shadow Wings
+
+    O.send("z", primId, true);
+    O.send("F", 1, angle);
+    O.send("F", 0, angle);
+
+    markWeaponUsed(0, primId);
+
+    // Queue tick 2 for Jl
+    _doubleHitState = 1;
+}
 
 function _getBestBreakingWeapon() {
     if (!v || !v.weapons || v.weapons.length === 0) return 0;
@@ -4923,8 +4979,6 @@ function _equipAcc(id, force) {
     O.send("c", 0, id, 1);
 }
 
-let _awaitingAttackAck = false;
-
 function _oneTickHat(hatId) {
     if (!v || !v.alive) return;
     _equipHat(hatId, true);
@@ -4940,9 +4994,9 @@ function _oneTickAcc(accId) {
 function _getBaseHat() {
     if (!v || !v.alive) return 0;
 
-    const spearRangeThreshold = 280; // Spear reach (142) + player scales (70) + buffer (68)
+    const spearRangeThreshold = 280;
 
-    // Check if any enemy turret is in shooting range (700 units)
+    // 1. Check for Turrets
     let turretInRange = false;
     if (ge) {
         for (let i = 0; i < ge.length; i++) {
@@ -4958,7 +5012,7 @@ function _getBaseHat() {
         }
     }
 
-    // Check if enemy player is within spear range
+    // 2. Check for Enemies
     let enemyWithinSpear = false;
     let enemyWithMeleeWithinSpear = false;
     if (E) {
@@ -4976,22 +5030,17 @@ function _getBaseHat() {
         }
     }
 
-    let targetHat = 12; // default Booster Hat
+    // 3. Base Selection: Flipper in river, Booster on land
+    let targetHat = _isInRiver(v) ? 31 : 12;
+
     if (turretInRange) {
-        if (enemyWithMeleeWithinSpear) {
-            targetHat = 6; // Soldier Helmet when enemy with melee weapon is within spear range
-        } else {
-            targetHat = 22; // EMP Helmet when turret in range
-        }
-    } else {
-        if (enemyWithinSpear) {
-            targetHat = 6; // Soldier Helmet when enemy in spear range
-        } else {
-            targetHat = 12; // Booster Hat default
-        }
+        targetHat = enemyWithMeleeWithinSpear ? 6 : 22;
+    } else if (enemyWithinSpear) {
+        targetHat = 6;
     }
 
     if (_isOwnedHat(targetHat)) return targetHat;
+    if (_isInRiver(v) && _isOwnedHat(31)) return 31;
     if (_isOwnedHat(12)) return 12;
     if (_isOwnedHat(6)) return 6;
     return 0;
@@ -4999,19 +5048,17 @@ function _getBaseHat() {
 
 function _getBaseAcc() {
     if (!v || !v.alive) return 0;
-    if (_isOwnedAcc(11)) return 11; // Monkey Tail default if owned
+    if (_isOwnedAcc(11)) return 11; // Monkey Tail default
     return 0;
 }
 
 function _updateBaseEquip() {
     if (!v || !v.alive) return;
-    if (!_hatOverrideTimer) {
+    if (!_awaitingAttackAck) {
         const baseHat = _getBaseHat();
         if (_isOwnedHat(baseHat) && (v.skinIndex !== baseHat || _lastEquippedHat !== baseHat)) {
             _equipHat(baseHat, false);
         }
-    }
-    if (!_accOverrideTimer) {
         const baseAcc = _getBaseAcc();
         if (_isOwnedAcc(baseAcc) && (v.tailIndex !== baseAcc || _lastEquippedAcc !== baseAcc)) {
             _equipAcc(baseAcc, false);
@@ -5019,7 +5066,6 @@ function _updateBaseEquip() {
     }
 }
 
-// ── WITH THIS:
 function _triggerAttackSwing() {
     if (!v || !v.alive || v.buildIndex >= 0) return;
     const curWpnIdx = (v.weaponIndex != null) ? v.weaponIndex : 0;
@@ -5047,23 +5093,19 @@ function _onAttackTick(weaponIndex) {
     const curWpnIdx = (weaponIndex != null) ? weaponIndex : ((v.weaponIndex != null) ? v.weaponIndex : 0);
     const curWpnId = (v.weapons && v.weapons[curWpnIdx] != null) ? v.weapons[curWpnIdx] : 0;
 
-    // 1. Right-click breaking weapon / hammer swing -> 1-tick Tank Gear (40)
     if (_rmbHammerActive || curWpnId === 10) {
-        _oneTickHat(40);
+        _oneTickHat(40); // Tank Gear on building break
         return;
     }
 
-    // 2. Primary weapon swing check (sword, katana, spear, daggers, axes)
     if (_DAMAGE_DEALING_WEAPONS.indexOf(curWpnId) !== -1) {
-        // Switch to Shadow Wings (19) for 1 tick, restore Monkey Tail
-        _oneTickAcc(19);
-
-        // If T key is held -> switch to Bull Helmet (7) for 1 tick, restore base hat
+        _oneTickAcc(19); // Shadow Wings on melee swing
         if (_tKeyHeld) {
-            _oneTickHat(7);
+            _oneTickHat(7); // Bull Helmet if T held
         }
     }
 }
+
 window.showItemInfo = $;
 window.selectSkinColor = hl;
 window.changeStoreIndex = sl;
