@@ -3632,7 +3632,7 @@ function ml(e) {
 
     // ── Original key handling ──
     if (t == 69) { wl(); return; }
-    if (t == 67) { tl(); return; }
+    if (t == 67) { tryDoubleHit(); return; }
     if (t == 88) { gl(); return; }
     if (v.weapons[t - 49] != null) { je(v.weapons[t - 49], !0); return; }
     if (v.items[t - 49 - v.weapons.length] != null) { je(v.items[t - 49 - v.weapons.length]); return; }
@@ -4231,17 +4231,16 @@ function Pl(e, t, i) {
     if (r) {
         r.startAnim(t, i);
         if (r === v) {
-            // The server has confirmed the attack damage calculation on this exact tick.
-            // It is now safe to return to the base movement/defense hat.
+            // Server confirmed the attack tick! Restore base equipment.
             if (_awaitingAttackAck) {
                 _awaitingAttackAck = false;
                 _updateBaseEquip();
             }
 
-            if (b.weapons[v.weaponIndex]) {
-                v.reloadMax = b.weapons[v.weaponIndex].speed;
-                v.reloadTimer = v.reloadMax;
-            }
+            // Sync slot cooldown tracker on confirmed attack
+            const curSlot = (v.weaponIndex != null) ? v.weaponIndex : 0;
+            const curWpnId = (v.weapons && v.weapons[curSlot] != null) ? v.weapons[curSlot] : 0;
+            markWeaponUsed(curSlot, curWpnId);
         }
     }
 }
@@ -4714,6 +4713,67 @@ setInterval(function _tickAutoBuyHat() {
 }, 1000);
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// INDEPENDENT PER-SLOT RELOAD TRACKER & DOUBLE-HIT COMBO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const weaponReadyAt = {
+    0: 0, // Timestamp when Primary is ready
+    1: 0  // Timestamp when Secondary is ready
+};
+
+function getWeaponCooldown(weaponId) {
+    const wpn = b.weapons[weaponId];
+    if (!wpn) return 300;
+    const hat = Ze.find(h => h.id === v.skinIndex);
+    const atkSpdMult = (hat && hat.atkSpd) ? hat.atkSpd : 1.0;
+    return (wpn.speed || 300) * atkSpdMult;
+}
+
+function canAttack(slotIndex) {
+    return Date.now() >= (weaponReadyAt[slotIndex] || 0);
+}
+
+function markWeaponUsed(slotIndex, weaponId) {
+    const cooldown = getWeaponCooldown(weaponId);
+    weaponReadyAt[slotIndex] = Date.now() + cooldown;
+}
+
+function tryDoubleHit() {
+    if (!v || !v.alive || !Jn()) return;
+
+    const primId = v.weapons[0];
+    const secId = v.weapons[1];
+    if (primId == null || secId == null) return;
+
+    // Verify both Primary and Secondary are completely off cooldown
+    if (!canAttack(0) || !canAttack(1)) return;
+
+    const angle = Ci();
+
+    // 1. Equip damage gear (Bull Helmet & Shadow Wings if owned)
+    if (_isOwnedHat(7)) _equipHat(7, true);
+    if (_isOwnedAcc(19)) _equipAcc(19, true);
+    _awaitingAttackAck = true;
+
+    // 2. Burst Primary swing
+    O.send("z", primId, true);
+    O.send("F", 1, angle);
+    O.send("F", 0, angle);
+
+    // 3. Burst Secondary shot/swing
+    O.send("z", secId, true);
+    O.send("F", 1, angle);
+    O.send("F", 0, angle);
+
+    // 4. Return to Primary
+    O.send("z", primId, true);
+
+    // 5. Lock both slots with their authoritative cooldowns
+    markWeaponUsed(0, primId);
+    markWeaponUsed(1, secId);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // AUTOMATED COMBAT HAT & ACCESSORY MACRO SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -4786,19 +4846,14 @@ let _awaitingAttackAck = false;
 
 function _oneTickHat(hatId) {
     if (!v || !v.alive) return;
-    // Equip the combat hat immediately before the attack
     _equipHat(hatId, true);
     _awaitingAttackAck = true;
 }
 
 function _oneTickAcc(accId) {
     if (!v || !v.alive) return;
-    if (_accOverrideTimer) clearTimeout(_accOverrideTimer);
     _equipAcc(accId, true);
-    _accOverrideTimer = setTimeout(function() {
-        _accOverrideTimer = null;
-        _updateBaseEquip();
-    }, 150);
+    _awaitingAttackAck = true;
 }
 
 function _getBaseHat() {
@@ -4883,24 +4938,24 @@ function _updateBaseEquip() {
     }
 }
 
+// ── WITH THIS:
 function _triggerAttackSwing() {
     if (!v || !v.alive || v.buildIndex >= 0) return;
     const curWpnIdx = (v.weaponIndex != null) ? v.weaponIndex : 0;
-    const curWpn = b.weapons[curWpnIdx];
-    const wpnSpeed = (curWpn && curWpn.speed) ? curWpn.speed : 300;
-    const atkSpdMult = (v.skin && v.skin.atkSpd) ? v.skin.atkSpd : 1;
-    const cooldown = wpnSpeed * atkSpdMult;
+    const curWpnId = (v.weapons && v.weapons[curWpnIdx] != null) ? v.weapons[curWpnIdx] : 0;
 
-    _nextAttackTime = Date.now() + cooldown;
-    _onAttackTick(curWpnIdx);
+    if (canAttack(curWpnIdx)) {
+        markWeaponUsed(curWpnIdx, curWpnId);
+        _onAttackTick(curWpnIdx);
+    }
 }
 
 function _checkAttackLoop() {
     if (!v || !v.alive || v.buildIndex >= 0) return;
     const isAttacking = (U === 1 || v.autoGather === 1 || _rmbHammerActive);
     if (isAttacking) {
-        const now = Date.now();
-        if (now >= _nextAttackTime) {
+        const curWpnIdx = (v.weaponIndex != null) ? v.weaponIndex : 0;
+        if (canAttack(curWpnIdx)) {
             _triggerAttackSwing();
         }
     }
